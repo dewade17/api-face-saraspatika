@@ -1,0 +1,14 @@
+flask
+flask-cors
+python-dotenv
+insightface
+onnxruntime
+opencv-python
+numpy
+requests
+SQLAlchemy
+psycopg2-binary
+cryptography>=42,<45
+celery
+redis
+gunicorn
