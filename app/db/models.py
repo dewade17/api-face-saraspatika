@@ -193,6 +193,8 @@ class Absensi(Base):
     id_user = Column(String(36), ForeignKey("users.id_user", ondelete="CASCADE"), nullable=False)
     id_jadwal_shift = Column(String(36), ForeignKey("jadwal_shift_kerja.id_jadwal_shift"), nullable=True)
 
+    correlation_id = Column(String(36), unique=True, index=True, nullable=True)
+    
     # Foreign Keys untuk Lokasi (Datang & Pulang)
     id_lokasi_datang = Column(String(36), ForeignKey("lokasi.id_lokasi"), nullable=True)
     id_lokasi_pulang = Column(String(36), ForeignKey("lokasi.id_lokasi"), nullable=True)

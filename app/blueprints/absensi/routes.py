@@ -9,8 +9,10 @@ Endpoints:
 
 * POST /checkin  -verify the user's face, then enqueue a Celery task to record
   a check-in.  Requires ``user_id``, ``location_id``, ``lat``, ``lng`` and ``image``.
+  Optionally accepts ``correlation_id`` as an idempotency key from client.
 * POST /checkout -verify the user's face, then enqueue a Celery task to record
-  a check-out.  Requires ``user_id``, ``absensi_id``, ``lat``, ``lng`` and ``image``.
+  a check-out.  Requires ``user_id``, ``lat``, ``lng`` and ``image`` plus one of
+  ``absensi_id`` or ``correlation_id``.
 * GET /status    -return today's attendance record for the given ``user_id``.
 
 """
@@ -55,6 +57,7 @@ def checkin() -> tuple[dict[str, object], int] | tuple[dict[str, object], int]:
     * ``location_id`` -the UUID of the location where the user is present.
     * ``lat``/``lng`` -latitude and longitude as floats.
     * ``image`` -the uploaded photo used for face verification.
+    * ``correlation_id`` -optional client-generated idempotency key.
 
     The endpoint validates the inputs, verifies the face using the
     synchronous :func:`~app.services.face_service.verify_user` helper and
@@ -67,6 +70,7 @@ def checkin() -> tuple[dict[str, object], int] | tuple[dict[str, object], int]:
     lng = request.form.get("lng", type=float)
     img_file = request.files.get("image")
     captured_at = (request.form.get("captured_at") or "").strip() #(aplikasi mode offline)
+    correlation_id = (request.form.get("correlation_id") or "").strip() or None
     
     if not user_id:
         return error("user_id wajib ada", 400)
@@ -111,11 +115,12 @@ def checkin() -> tuple[dict[str, object], int] | tuple[dict[str, object], int]:
         "today_local": attendance_date, # Gunakan tanggal kejadian asli
         "now_local_iso": now_iso,       # Waktu presensi asli
         "location": {"id": loc_id, "lat": lat, "lng": lng},
+        "correlation_id": correlation_id,
     }
     # Enqueue asynchronous processing
     process_checkin_task_v2.delay(payload)
 
-    return ok(message="Check-in sedang diproses", user_id=user_id,)
+    return ok(message="Check-in sedang diproses", user_id=user_id, correlation_id=correlation_id)
 
 
 @absensi_bp.post("/checkout")
@@ -127,15 +132,18 @@ def checkout() -> tuple[dict[str, object], int] | tuple[dict[str, object], int]:
     Expected form-data fields:
 
     * ``user_id`` -the UUID of the user performing check-out.
-    * ``absensi_id`` -the UUID of the attendance record to update.
+    * ``absensi_id`` -optional UUID of the attendance record to update.
+    * ``correlation_id`` -optional client-generated id (same id used on check-in).
     * ``lat``/``lng`` -latitude and longitude as floats.
     * ``image`` -the uploaded photo used for face verification.
 
     The endpoint validates the inputs, verifies the face synchronously and
-    then schedules a Celery task to update the attendance record.
+    then schedules a Celery task to update the attendance record. At least
+    one of ``absensi_id`` or ``correlation_id`` must be provided.
     """
     user_id = (request.form.get("user_id") or "").strip()
     absensi_id = (request.form.get("absensi_id") or "").strip()
+    correlation_id = (request.form.get("correlation_id") or "").strip() or None
     loc_id = (request.form.get("location_id") or "").strip()
     lat = request.form.get("lat", type=float)
     lng = request.form.get("lng", type=float)
@@ -144,8 +152,8 @@ def checkout() -> tuple[dict[str, object], int] | tuple[dict[str, object], int]:
 
     if not user_id:
         return error("user_id wajib ada", 400)
-    if not absensi_id:
-        return error("absensi_id wajib ada", 400)
+    if not absensi_id and not correlation_id:
+        return error("absensi_id atau correlation_id wajib ada", 400)
     if lat is None or lng is None:
         return error("lat/lng wajib ada", 400)
     if img_file is None:
@@ -168,6 +176,7 @@ def checkout() -> tuple[dict[str, object], int] | tuple[dict[str, object], int]:
     payload = {
         "user_id": user_id,
         "absensi_id": absensi_id,
+        "correlation_id": correlation_id,
         "now_local_iso": now_iso,
         "location": {"id": loc_id, "lat": lat, "lng": lng},
     }
