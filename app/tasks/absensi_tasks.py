@@ -60,6 +60,9 @@ def process_checkin_task_v2(self, payload: Dict[str, Any]) -> Dict[str, Any]:
     location = payload.get("location", {})
     correlation_id = (payload.get("correlation_id") or "").strip() or None
 
+    # Ambil status verifikasi wajah; default True untuk menjaga kompatibilitas lama.
+    face_verified = payload.get("face_verified", True)
+
     with get_session() as s:
         try:
             # Idempotency: same correlation_id means same logical check-in.
@@ -124,7 +127,7 @@ def process_checkin_task_v2(self, payload: Dict[str, Any]) -> Dict[str, Any]:
                 status_masuk=status_kehadiran,
                 in_latitude=location.get("lat"),
                 in_longitude=location.get("lng"),
-                face_verified_masuk=True,
+                face_verified_masuk=face_verified,
                 face_verified_pulang=False,
             )
             s.add(rec)
@@ -186,6 +189,8 @@ def process_checkout_task_v2(self, payload: Dict[str, Any]) -> Dict[str, Any]:
     the operation is treated as idempotent and no update is applied.
     """
     logger.info("[process_checkout_task_v2] start payload=%s", payload)
+    # Ambil status verifikasi wajah; default True untuk kompatibilitas lama.
+    face_verified = payload.get("face_verified", True)
     user_id = payload.get("user_id")
     absensi_id = (payload.get("absensi_id") or "").strip() or None
     correlation_id = (payload.get("correlation_id") or "").strip() or None
@@ -248,7 +253,8 @@ def process_checkout_task_v2(self, payload: Dict[str, Any]) -> Dict[str, Any]:
             rec.id_lokasi_pulang = location.get("id")
             rec.out_latitude = location.get("lat")
             rec.out_longitude = location.get("lng")
-            rec.face_verified_pulang = True
+            # Gunakan status verifikasi wajah yang dikirim dari endpoint.
+            rec.face_verified_pulang = face_verified
             # Default status for checkout is on time
             rec.status_pulang = StatusAbsensi.TEPAT
 

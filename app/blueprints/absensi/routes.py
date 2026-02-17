@@ -83,7 +83,11 @@ def checkin() -> tuple[dict[str, object], int] | tuple[dict[str, object], int]:
 
     # Synchronous face verification.  Any errors here will abort the request.
     try:
-        verify_user(user_id, img_file)
+        # Lakukan verifikasi wajah; fungsi ini mengembalikan dict dengan kunci 'match'.
+        verification = verify_user(user_id, img_file)
+        # Jika wajah tidak cocok, hentikan permintaan dengan pesan error.
+        if not bool(verification.get("match", False)):
+            return error("Wajah tidak cocok dengan data registrasi", 400)
     except FileNotFoundError as e:
         # Embedding for user not found
         return error(str(e), 404)
@@ -110,12 +114,14 @@ def checkin() -> tuple[dict[str, object], int] | tuple[dict[str, object], int]:
     attendance_date = now_iso.split('T')[0] 
 
     # Compose payload for Celery task
+    # Sertakan hasil verifikasi wajah dalam payload untuk disimpan pada record absensi.
     payload = {
         "user_id": user_id,
-        "today_local": attendance_date, # Gunakan tanggal kejadian asli
-        "now_local_iso": now_iso,       # Waktu presensi asli
+        "today_local": attendance_date,  # Gunakan tanggal kejadian asli
+        "now_local_iso": now_iso,        # Waktu presensi asli
         "location": {"id": loc_id, "lat": lat, "lng": lng},
         "correlation_id": correlation_id,
+        "face_verified": verification.get("match", False),
     }
     # Enqueue asynchronous processing
     process_checkin_task_v2.delay(payload)
@@ -161,7 +167,10 @@ def checkout() -> tuple[dict[str, object], int] | tuple[dict[str, object], int]:
 
     # Face verification
     try:
-        verify_user(user_id, img_file)
+        verification = verify_user(user_id, img_file)
+        # Sama dengan check-in: jangan lanjutkan jika wajah tidak cocok.
+        if not bool(verification.get("match", False)):
+            return error("Wajah tidak cocok dengan data registrasi", 400)
     except FileNotFoundError as e:
         return error(str(e), 404)
     except Exception as e:
@@ -173,12 +182,14 @@ def checkout() -> tuple[dict[str, object], int] | tuple[dict[str, object], int]:
     now_iso = captured_at if captured_at else now_local().isoformat()
 
     # Compose payload and enqueue task
+    # Sertakan hasil verifikasi wajah untuk disimpan pada record checkout.
     payload = {
         "user_id": user_id,
         "absensi_id": absensi_id,
         "correlation_id": correlation_id,
         "now_local_iso": now_iso,
         "location": {"id": loc_id, "lat": lat, "lng": lng},
+        "face_verified": verification.get("match", False),
     }
     process_checkout_task_v2.delay(payload)
     return ok(message="Check-out sedang diproses", user_id=user_id)
