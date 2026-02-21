@@ -21,7 +21,7 @@ class BaseConfig:
     NEXTCLOUD_PASS = ""
     NEXTCLOUD_DEFAULT_FOLDER = "uploads"
 
-    MODEL_NAME = "buffalo_l"
+    MODEL_NAME = "buffalo_s"
     SIGNED_URL_EXPIRES = 604800
     MAX_CONTENT_LENGTH = 16 * 1024 * 1024
     JSON_SORT_KEYS = False
@@ -52,6 +52,7 @@ def load_config(app):
         DATABASE_URL = os.getenv('DATABASE_URL', ''),
         TIMEZONE = os.getenv('TIMEZONE', 'Asia/Makassar'),
         DEFAULT_GEOFENCE_RADIUS = int(os.getenv('DEFAULT_GEOFENCE_RADIUS', '100')),
+        MODEL_NAME = os.getenv('MODEL_NAME', 'buffalo_s'),
     
         # Nextcloud variables
         NEXTCLOUD_URL = os.getenv("NEXTCLOUD_URL", ""),

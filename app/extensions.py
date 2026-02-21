@@ -81,7 +81,14 @@ def init_face_engine(app=None):
 
     try:
         providers = ["CPUExecutionProvider"]
-        model_name = "buffalo_l"
+        model_name = "buffalo_s"
+        if app is not None:
+            model_name = app.config.get("MODEL_NAME", model_name)
+        else:
+            try:
+                model_name = current_app.config.get("MODEL_NAME", model_name)
+            except Exception:
+                pass
         det_size = (640, 640)
 
         engine = FaceAnalysis(name=model_name, providers=providers)
