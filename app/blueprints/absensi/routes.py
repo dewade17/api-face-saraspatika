@@ -1,46 +1,33 @@
-"""
-Simplified Absensi (attendance) endpoints.
-
-This module defines three endpoints for checking in, checking out and
-    retrieving attendance status for a user.  The implementation aligns
-    with the SQLAlchemy models defined in :mod:`app.db.models`.
-
-Endpoints:
-
-* POST /checkin  -verify the user's face, then enqueue a Celery task to record
-  a check-in.  Requires ``user_id``, ``location_id``, ``lat``, ``lng`` and ``image``.
-  Optionally accepts ``correlation_id`` as an idempotency key from client.
-* POST /checkout -verify the user's face, then enqueue a Celery task to record
-  a check-out.  Requires ``user_id``, ``lat``, ``lng`` and ``image`` plus one of
-  ``absensi_id`` or ``correlation_id``.
-* GET /status    -return today's attendance record for the given ``user_id``.
-
-"""
-
 from __future__ import annotations
 
-from datetime import date
 from flask import Blueprint, request, current_app
+from kombu.exceptions import OperationalError as KombuOperationalError
 from sqlalchemy import func
 
 from ...utils.responses import ok, error
 from ...utils.auth_utils import token_required, get_user_id_from_auth
 from ...utils.rbac_utils import require_permission
-from ...services.face_service import verify_user
 from ...db import get_session
 from ...db.models import (
-    User,
     Absensi,
-    Lokasi,
 )
-from ...utils.timez import now_local, today_local_date
+from ...utils.timez import today_local_date
+from .checkin_helpers import (
+    build_payload,
+    enqueue_checkin,
+    get_user_and_location,
+    parse_checkin_request,
+    parse_captured_at_datetime,
+    verify_face as verify_checkin_face,
+)
+from .checkout_helpers import (
+    build_checkout_payload,
+    enqueue_checkout,
+    parse_checkout_request,
+    verify_checkout_face,
+)
 
 # Import Celery tasks that persist the attendance data asynchronously
-from app.tasks.absensi_tasks import (
-    process_checkin_task_v2,
-    process_checkout_task_v2,
-)
-
 # Prefix is attached by the application factory when registering the blueprint
 absensi_bp = Blueprint("absensi", __name__)
 
@@ -48,151 +35,144 @@ absensi_bp = Blueprint("absensi", __name__)
 @absensi_bp.post("/checkin")
 @token_required
 @require_permission("absensi", "create")
-def checkin() -> tuple[dict[str, object], int] | tuple[dict[str, object], int]:
-    """Verify a user's face and enqueue an asynchronous check-in task.
-
-    Expected form-data fields:
-
-    * ``user_id`` -the UUID of the user performing check-in.
-    * ``location_id`` -the UUID of the location where the user is present.
-    * ``lat``/``lng`` -latitude and longitude as floats.
-    * ``image`` -the uploaded photo used for face verification.
-    * ``correlation_id`` -optional client-generated idempotency key.
-
-    The endpoint validates the inputs, verifies the face using the
-    synchronous :func:`~app.services.face_service.verify_user` helper and
-    then schedules a Celery task to write the attendance record.  A 202
-    response is returned immediately.
-    """
-    user_id = (request.form.get("user_id") or "").strip()
-    loc_id = (request.form.get("location_id") or "").strip()
-    lat = request.form.get("lat", type=float)
-    lng = request.form.get("lng", type=float)
-    img_file = request.files.get("image")
-    captured_at = (request.form.get("captured_at") or "").strip() #(aplikasi mode offline)
-    correlation_id = (request.form.get("correlation_id") or "").strip() or None
-    
-    if not user_id:
-        return error("user_id wajib ada", 400)
-    if not loc_id:
-        return error("location_id wajib ada", 400)
-    if lat is None or lng is None:
-        return error("lat/lng wajib ada", 400)
-    if img_file is None:
-        return error("Field 'image' wajib ada", 400)
-
-    # Synchronous face verification.  Any errors here will abort the request.
+def checkin() -> tuple[dict[str, object], int]:
     try:
-        # Lakukan verifikasi wajah; fungsi ini mengembalikan dict dengan kunci 'match'.
-        verification = verify_user(user_id, img_file)
-        # Jika wajah tidak cocok, hentikan permintaan dengan pesan error.
-        if not bool(verification.get("match", False)):
-            return error("Wajah tidak cocok dengan data registrasi", 400)
-    except FileNotFoundError as e:
-        # Embedding for user not found
-        return error(str(e), 404)
-    except Exception as e:
-        current_app.logger.error(f"Kesalahan tidak terduga saat verifikasi wajah di checkin: {e}", exc_info=True)
-        return error(str(e), 500)
+        checkin_data = parse_checkin_request(request)
+    except ValueError:
+        return error("Wah, datanya belum lengkap nih. Pastikan foto dan lokasimu sudah terisi semua ya!", 400)
 
-    # Confirm that the user and location exist.
     with get_session() as s:
-        u = s.get(User, user_id)
-        if u is None:
-            return error("User tidak ditemukan", 404)
-        loc = s.get(Lokasi, loc_id)
-        if loc is None:
-            return error("Lokasi tidak ditemukan", 404)
-        
-    # --- LOGIKA PENENTUAN WAKTU (aplikasi mode offline) ---
-    # Jika ada captured_at (dari Flutter), gunakan itu sebagai waktu resmi.
-    # Jika tidak ada, gunakan waktu server (fallback).
-    now_iso = captured_at if captured_at else now_local().isoformat()
-    
-    # Sangat penting: Ambil tanggal (YYYY-MM-DD) dari timestamp kejadian
-    # agar pencarian shift kerja (JadwalShiftKerja) akurat. 
-    attendance_date = now_iso.split('T')[0] 
+        u, loc = get_user_and_location(s, checkin_data.user_id, checkin_data.loc_id)
+        if not u:
+            return error("Maaf, akun kamu tidak ditemukan di sistem kami.", 404)
+    location_exists = loc is not None
 
-    # Compose payload for Celery task
-    # Sertakan hasil verifikasi wajah dalam payload untuk disimpan pada record absensi.
-    payload = {
-        "user_id": user_id,
-        "today_local": attendance_date,  # Gunakan tanggal kejadian asli
-        "now_local_iso": now_iso,        # Waktu presensi asli
-        "location": {"id": loc_id, "lat": lat, "lng": lng},
-        "correlation_id": correlation_id,
-        "face_verified": verification.get("match", False),
-    }
-    # Enqueue asynchronous processing
-    process_checkin_task_v2.delay(payload)
+    try:
+        captured_dt = parse_captured_at_datetime(checkin_data.captured_at)
+    except ValueError:
+        return error("Format 'captured_at' tidak valid. Gunakan ISO 8601, misalnya 2026-03-02T08:30:00+08:00.", 400)
+    attendance_date = captured_dt.date()
 
-    return ok(message="Check-in sedang diproses", user_id=user_id, correlation_id=correlation_id)
+    # 1) Verifikasi wajah: pisahkan dari proses lain agar error lebih terarah.
+    try:
+        face_match = verify_checkin_face(checkin_data.user_id, checkin_data.img_file)
+    except FileNotFoundError:
+        return error("Data foto referensi kamu belum ada. Silakan hubungi admin untuk pendaftaran wajah.", 404)
+    except (RuntimeError, ValueError, TypeError) as e:
+        current_app.logger.warning(
+            "Verifikasi wajah check-in gagal untuk user_id=%s: %s",
+            checkin_data.user_id,
+            e,
+        )
+        return error("Foto wajah tidak valid atau wajah tidak terdeteksi. Coba ambil foto lagi dengan lebih jelas, ya!", 400)
+    except Exception as e:
+        current_app.logger.error("Kesalahan tak terduga saat verifikasi check-in: %s", e, exc_info=True)
+        return error("Ups, sistem kami sedang mengalami sedikit kendala. Silakan coba lagi sebentar lagi ya!", 500)
+
+    if not face_match:
+        return error("Wajahmu tidak sesuai dengan data kami. Coba ambil foto lagi dengan pencahayaan yang lebih terang, ya!", 400)
+
+    if not location_exists:
+        return error("Aduh, lokasi absensi ini tidak terdaftar. Silakan pilih lokasi yang sesuai.", 404)
+
+    payload = build_payload(
+        user_id=checkin_data.user_id,
+        loc_id=checkin_data.loc_id,
+        lat=checkin_data.lat,
+        lng=checkin_data.lng,
+        captured_dt=captured_dt,
+        attendance_date=attendance_date,
+        correlation_id=checkin_data.correlation_id,
+    )
+
+    # 2) Enqueue Celery: tangani kegagalan broker secara eksplisit.
+    try:
+        enqueue_checkin(payload)
+    except KombuOperationalError as e:
+        current_app.logger.error("Gagal enqueue check-in ke broker Celery: %s", e, exc_info=True)
+        return error("Layanan antrean absensi sedang bermasalah. Silakan coba lagi beberapa saat lagi.", 500)
+    except Exception as e:
+        current_app.logger.error("Kesalahan tak terduga saat enqueue check-in: %s", e, exc_info=True)
+        return error("Ups, sistem kami sedang mengalami sedikit kendala. Silakan coba lagi sebentar lagi ya!", 500)
+
+    return ok(
+        message="Terima kasih! Absensi kamu sedang kami proses.",
+        user_id=checkin_data.user_id,
+        correlation_id=checkin_data.correlation_id,
+    )
 
 
 @absensi_bp.post("/checkout")
 @token_required
 @require_permission("absensi", "update")
-def checkout() -> tuple[dict[str, object], int] | tuple[dict[str, object], int]:
-    """Verify a user's face and enqueue an asynchronous check-out task.
+def checkout() -> tuple[dict[str, object], int]:
+    # 1) Parse input
+    try:
+        checkout_data = parse_checkout_request(request)
+    except ValueError:
+        return error(
+            "Data absensi pulang kamu belum lengkap. Pastikan foto, lokasi, dan data absensi masuk sudah terisi ya.",
+            400,
+        )
 
-    Expected form-data fields:
+    with get_session() as s:
+        u, _ = get_user_and_location(s, checkout_data.user_id, checkout_data.loc_id)
+        if not u:
+            return error("Maaf, akun kamu tidak ditemukan di sistem kami.", 404)
 
-    * ``user_id`` -the UUID of the user performing check-out.
-    * ``absensi_id`` -optional UUID of the attendance record to update.
-    * ``correlation_id`` -optional client-generated id (same id used on check-in).
-    * ``lat``/``lng`` -latitude and longitude as floats.
-    * ``image`` -the uploaded photo used for face verification.
-
-    The endpoint validates the inputs, verifies the face synchronously and
-    then schedules a Celery task to update the attendance record. At least
-    one of ``absensi_id`` or ``correlation_id`` must be provided.
-    """
-    user_id = (request.form.get("user_id") or "").strip()
-    absensi_id = (request.form.get("absensi_id") or "").strip()
-    correlation_id = (request.form.get("correlation_id") or "").strip() or None
-    loc_id = (request.form.get("location_id") or "").strip()
-    lat = request.form.get("lat", type=float)
-    lng = request.form.get("lng", type=float)
-    img_file = request.files.get("image")
-    captured_at = (request.form.get("captured_at") or "").strip() #(aplikasi mode offline)
-
-    if not user_id:
-        return error("user_id wajib ada", 400)
-    if not absensi_id and not correlation_id:
-        return error("absensi_id atau correlation_id wajib ada", 400)
-    if lat is None or lng is None:
-        return error("lat/lng wajib ada", 400)
-    if img_file is None:
-        return error("Field 'image' wajib ada", 400)
+    try:
+        captured_dt = parse_captured_at_datetime(checkout_data.captured_at)
+    except ValueError:
+        return error(
+            "Waktu pengambilan foto tidak terbaca. Pastikan jam di perangkat kamu benar lalu coba lagi.",
+            400,
+        )
+    now_iso = captured_dt.isoformat()
 
     # Face verification
     try:
-        verification = verify_user(user_id, img_file)
-        # Sama dengan check-in: jangan lanjutkan jika wajah tidak cocok.
-        if not bool(verification.get("match", False)):
-            return error("Wajah tidak cocok dengan data registrasi", 400)
-    except FileNotFoundError as e:
-        return error(str(e), 404)
+        face_match = verify_checkout_face(checkout_data.user_id, checkout_data.img_file)
+    except FileNotFoundError:
+        return error("Data foto referensi kamu belum ada. Silakan hubungi admin untuk pendaftaran wajah.", 404)
+    except (RuntimeError, ValueError, TypeError) as e:
+        current_app.logger.warning(
+            "Verifikasi wajah check-out gagal untuk user_id=%s: %s",
+            checkout_data.user_id,
+            e,
+        )
+        return error("Foto wajah tidak valid atau wajah tidak terdeteksi. Coba ambil foto lagi dengan lebih jelas, ya!", 400)
     except Exception as e:
-        current_app.logger.error(f"Kesalahan tidak terduga saat verifikasi wajah di checkout: {e}", exc_info=True)
-        return error(str(e), 500)
-    
-    
-    # Tentukan waktu checkout asli (aplikasi mode offline)
-    now_iso = captured_at if captured_at else now_local().isoformat()
+        current_app.logger.error("Kesalahan tak terduga saat verifikasi check-out: %s", e, exc_info=True)
+        return error("Ups, sistem kami sedang mengalami sedikit kendala. Silakan coba lagi sebentar lagi ya!", 500)
+
+    # Sama dengan check-in: jangan lanjutkan jika wajah tidak cocok.
+    if not face_match:
+        return error("Wajahmu tidak sesuai dengan data kami. Coba ambil foto lagi dengan pencahayaan yang lebih terang, ya!", 400)
 
     # Compose payload and enqueue task
     # Sertakan hasil verifikasi wajah untuk disimpan pada record checkout.
-    payload = {
-        "user_id": user_id,
-        "absensi_id": absensi_id,
-        "correlation_id": correlation_id,
-        "now_local_iso": now_iso,
-        "location": {"id": loc_id, "lat": lat, "lng": lng},
-        "face_verified": verification.get("match", False),
-    }
-    process_checkout_task_v2.delay(payload)
-    return ok(message="Check-out sedang diproses", user_id=user_id)
+    payload = build_checkout_payload(
+        user_id=checkout_data.user_id,
+        absensi_id=checkout_data.absensi_id,
+        correlation_id=checkout_data.correlation_id,
+        now_iso=now_iso,
+        loc_id=checkout_data.loc_id,
+        lat=checkout_data.lat,
+        lng=checkout_data.lng,
+        face_verified=face_match,
+    )
+
+    # 2) Enqueue Celery
+    try:
+        enqueue_checkout(payload)
+    except KombuOperationalError as e:
+        current_app.logger.error("Gagal enqueue check-out ke broker Celery: %s", e, exc_info=True)
+        return error("Layanan antrean absensi sedang bermasalah. Silakan coba lagi beberapa saat lagi.", 500)
+    except Exception as e:
+        current_app.logger.error("Kesalahan tak terduga saat enqueue check-out: %s", e, exc_info=True)
+        return error("Ups, sistem kami sedang mengalami sedikit kendala. Silakan coba lagi sebentar lagi ya!", 500)
+
+    return ok(message="Terima kasih! Absensi Pulang kamu sedang kami proses.", user_id=checkout_data.user_id)
 
 
 @absensi_bp.get("/status")

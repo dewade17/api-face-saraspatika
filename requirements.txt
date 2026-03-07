@@ -10,5 +10,6 @@ SQLAlchemy
 psycopg2-binary
 cryptography>=42,<45
 celery
+kombu
 redis
 gunicorn

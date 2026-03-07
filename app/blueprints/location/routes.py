@@ -8,6 +8,7 @@ from ...utils.rbac_utils import require_permission
 from ...utils.geo import haversine_m
 from ...db import get_session
 from ...db.models import Lokasi, User
+from .location_helper import parse_pagination, paginate_query
 
 # Penting: JANGAN menaruh prefix "/api/location" di sini.
 # Prefix akan dipasang saat register_blueprint() di create_app():
@@ -32,24 +33,20 @@ def _serialize(loc: Lokasi):
 def list_locations():
     """List + search + pagination: GET /api/location?q=&page=&page_size="""
     q = (request.args.get("q") or "").strip()
-    page = request.args.get("page", type=int, default=1)
-    page_size = request.args.get("page_size", type=int, default=20)
-    page = 1 if not page or page < 1 else page
-    page_size = 20 if not page_size or page_size < 1 else min(page_size, 100)
+    pagination = parse_pagination(request)
 
     with get_session() as s:
         qry = s.query(Lokasi)
         if q:
             like = f"%{q}%"
             qry = qry.filter(Lokasi.nama_lokasi.ilike(like))
-        total = qry.count()
-        items = (
-            qry.order_by(Lokasi.nama_lokasi.asc())
-            .offset((page - 1) * page_size)
-            .limit(page_size)
-            .all()
+        total, items = paginate_query(qry.order_by(Lokasi.nama_lokasi.asc()), pagination)
+        return ok(
+            total=total,
+            page=pagination.page,
+            page_size=pagination.page_size,
+            items=[_serialize(l) for l in items],
         )
-        return ok(total=total, page=page, page_size=page_size, items=[_serialize(l) for l in items])
 
 
 @location_bp.get("/<loc_id>")
@@ -90,4 +87,3 @@ def nearest_location():
             count=len(picked),
             items=[{**_serialize(l), "distanceMeters": float(d)} for l, d in picked],
         )
-
