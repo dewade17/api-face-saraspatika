@@ -62,6 +62,7 @@ def create_app():
                     "https://www.saraspatika-web.com",
                     "http://localhost:64704"
                     "http://localhost:9000"
+                    "http://localhost:52207"
                 ]
             }
         },
