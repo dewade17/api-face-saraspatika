@@ -1,6 +1,7 @@
 # flask_api_face/app/__init__.py
 
 from flask import Flask
+from flask_cors import CORS
 from .config import load_config
 from . import extensions
 from .middleware.error_handlers import register_error_handlers
@@ -50,5 +51,21 @@ def create_app():
             # Expose the default Nextcloud folder configured for uploads.
             "folder": app.config.get("NEXTCLOUD_DEFAULT_FOLDER"),
         }
+    
+    CORS(
+        app,
+        resources={
+            r"/api/*": {
+                "origins": [
+                    "http://localhost:3000",
+                    "https://saraspatika-web.com",
+                    "https://www.saraspatika-web.com",
+                    "http://localhost:64704"
+                    "http://localhost:9000"
+                ]
+            }
+        },
+        supports_credentials=True,
+    )
 
     return app
